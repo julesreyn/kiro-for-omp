@@ -13,7 +13,7 @@ and organization (IAM Identity Center) accounts, or a Kiro API key. It has no de
 ## Install
 
 ```sh
-omp install kiro-for-omp
+omp install github:julesreyn/kiro-for-omp
 ```
 
 Restart OMP, then check that your models are listed:
@@ -24,7 +24,11 @@ omp models kiro
 
 Nothing listed? You are not signed in yet: see [Sign in](#sign-in).
 
-To update, run `omp install kiro-for-omp@latest`, then restart OMP.
+To update to the latest version, run the same command with `--force`, then restart OMP:
+
+```sh
+omp install --force github:julesreyn/kiro-for-omp
+```
 
 ## Sign in
 
