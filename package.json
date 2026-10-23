@@ -2,6 +2,7 @@
   "name": "kiro-for-omp",
   "version": "0.1.1",
   "description": "Use your Kiro account's models in OMP, reusing your kiro-cli login",
+  "private": true,
   "type": "module",
   "keywords": [
     "omp",
@@ -21,11 +22,6 @@
   "engines": {
     "node": ">=22.18"
   },
-  "files": [
-    "index.ts",
-    "models.json",
-    "src/"
-  ],
   "scripts": {
     "test": "node --test \"tests/test-*.ts\""
   },
