@@ -1,0 +1,33 @@
+{
+  "name": "kiro-for-omp",
+  "version": "0.1.0",
+  "description": "Use your Kiro account's models in OMP, reusing your kiro-cli login",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "omp",
+    "omp-extension",
+    "kiro",
+    "llm-provider"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/julesreyn/kiro-for-omp.git"
+  },
+  "homepage": "https://github.com/julesreyn/kiro-for-omp#readme",
+  "bugs": {
+    "url": "https://github.com/julesreyn/kiro-for-omp/issues"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test \"tests/test-*.ts\""
+  },
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
