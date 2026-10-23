@@ -23,6 +23,7 @@ import type {
   ContextLike,
   CoreDependencies,
   ErrorReason,
+  MessageLike,
   ModelLike,
   StreamOptions,
   TextContent,
@@ -90,6 +91,14 @@ export function kiroEffortFields(
   if (supported.length === 0) return undefined
   const effort = supported.findLast((candidate) => order.indexOf(candidate) <= order.indexOf(level)) ?? supported[0]
   return { [modelId.startsWith("claude-") ? "output_config" : "reasoning"]: { effort } }
+}
+
+/** The text of every tool result in the conversation. */
+function toolOutputText(messages: readonly MessageLike[]): string {
+  return messages.flatMap((message) => [
+    ...(message.role === "toolResult" ? [JSON.stringify(message.content)] : []),
+    ...(message.toolResults ?? []).map((result) => result.content),
+  ]).join("\n")
 }
 
 export function resolveReasoningLevel(options?: StreamOptions): ReasoningLevel | undefined {
@@ -901,10 +910,12 @@ export function createStreamKiro(deps: CoreDependencies) {
               const textContent = output.content[textBlockIdx] as TextContent | undefined
               if (textContent && textContent.type === "text") {
                 const bracketResult = parseBracketToolCalls(textContent.text)
-                // Text can quote tool output, so recover calls only to tools offered in this request.
+                // Text can quote a file or a tool's output, so recover only calls to tools offered in
+                // this request that no earlier tool output already contains.
                 const offeredTools = new Set((context.tools ?? []).map((tool) => tool.name))
-                if (bracketResult.toolCalls.length > 0
-                  && bracketResult.toolCalls.every((call) => offeredTools.has(resolveToolName(call.name)))) {
+                const priorOutput = toolOutputText(context.messages)
+                if (bracketResult.toolCalls.length > 0 && bracketResult.toolCalls.every((call) =>
+                  offeredTools.has(resolveToolName(call.name)) && !priorOutput.includes(`[Called ${call.name} with`))) {
                   sawAnyToolCalls = true
                   textContent.text = bracketResult.cleanedText
                   for (const btc of bracketResult.toolCalls) {
