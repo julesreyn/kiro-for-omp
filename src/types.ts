@@ -59,7 +59,11 @@ export interface AssistantMessageLike {
   usage: Usage
   stopReason: TerminalReason
   errorMessage?: string
+  errorStatus?: number
   timestamp: number
+  /** Request duration and time to first model output, in milliseconds, for OMP stats. */
+  duration?: number
+  ttft?: number
 }
 
 export interface ModelLike {
@@ -150,6 +154,7 @@ export interface CoreDependencies {
   fetchImpl: typeof fetch
   createStream: () => AssistantMessageEventStreamLike
   now: () => number
+  monotonicNow?: () => number
   env: Record<string, string | undefined>
   /**
    * Ids of models whose reasoning stays server-side (`reasoningHidden` in models.json).

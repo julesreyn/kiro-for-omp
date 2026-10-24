@@ -13,9 +13,6 @@
  */
 
 import { randomUUID } from "node:crypto"
-import { join } from "node:path"
-import { tmpdir } from "node:os"
-import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import type {
   AssistantMessageEvent,
   AssistantMessageEventStreamLike,
@@ -47,13 +44,6 @@ const FIRST_TOKEN_TIMEOUT_MS = 180_000
 const IDLE_STREAM_TIMEOUT_MS = 300_000 // kiro-cli's own operation timeout
 const CONNECTION_TIMEOUT_MS = 120_000
 const MAX_CACHED_PROFILES = 32 // tokens rotate, so old entries are dead weight
-const KIRO_STREAM_GATE_POLL_MS = 500
-const KIRO_STREAM_GATE_HEARTBEAT_MS = 15_000
-const KIRO_STREAM_GATE_STALE_MS = 10 * 60_000
-// One directory per user, so other accounts on the machine can neither read nor hold the lock.
-const KIRO_STREAM_GATE_ROOT = join(tmpdir(), `kiro-for-omp-${process.getuid?.() ?? "user"}`)
-const KIRO_STREAM_GATE_DIR = join(KIRO_STREAM_GATE_ROOT, "stream.lock")
-const KIRO_STREAM_GATE_OWNER = join(KIRO_STREAM_GATE_DIR, "owner.json")
 
 // Thinking / reasoning configuration
 const HIDDEN_REASONING_COUNTDOWN_MS = 2000 // delay before the "reasoning hidden" placeholder
@@ -121,6 +111,22 @@ function headersToRecord(headers: Headers): Record<string, string> {
   return out
 }
 
+function retryAfterMs(headers: Headers, now: number): number | undefined {
+  const delays: number[] = []
+  const milliseconds = headers.get("retry-after-ms")
+  if (milliseconds?.trim()) {
+    const value = Number(milliseconds)
+    if (Number.isFinite(value) && value >= 0) delays.push(value)
+  }
+  const retryAfter = headers.get("retry-after")?.trim()
+  if (retryAfter) {
+    const seconds = Number(retryAfter)
+    const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - now
+    if (Number.isFinite(delay) && delay >= 0) delays.push(delay)
+  }
+  return delays.length ? Math.ceil(Math.max(...delays)) : undefined
+}
+
 /** A stream-level failure worth retrying. */
 class RetryableError extends Error {}
 
@@ -166,6 +172,7 @@ export function createStreamKiro(deps: CoreDependencies) {
   const hiddenReasoningModels = new Set(deps.hiddenReasoningModels ?? [])
   const fetchImpl = deps.fetchImpl ?? fetch
   const now = deps.now ?? (() => Date.now())
+  const monotonicNow = deps.monotonicNow ?? (() => performance.now())
 
   function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     if (signal.aborted) return Promise.reject(abortError())
@@ -205,86 +212,17 @@ export function createStreamKiro(deps: CoreDependencies) {
     })
   }
 
-  /** A gate whose owner crashed mid-stream is free at once, not after the stale timeout. */
-  function isProcessAlive(pid: unknown): boolean {
-    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return true
-    try {
-      process.kill(pid, 0)
-      return true
-    } catch (error: unknown) {
-      // EPERM: the process exists but belongs to someone else.
-      return (error as { code?: unknown }).code !== "ESRCH"
-    }
-  }
-
-  /** Creates the lock root, or reports false when it is a symlink or someone else's directory. */
-  function ownGateRoot(): boolean {
-    mkdirSync(KIRO_STREAM_GATE_ROOT, { recursive: true, mode: 0o700 })
-    const stat = lstatSync(KIRO_STREAM_GATE_ROOT)
-    if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) return false
-    if ((stat.mode & 0o077) !== 0) chmodSync(KIRO_STREAM_GATE_ROOT, 0o700)
-    return true
-  }
-
-  async function acquireKiroStreamGate(signal: AbortSignal): Promise<() => void> {
-    const env = deps.env ?? process.env
-    if (env.OMP_KIRO_STREAM_GATE === "0" || env.KIRO_STREAM_GATE === "0" || !ownGateRoot()) {
-      return () => {}
-    }
-
-    const token = `${process.pid}:${randomUUID()}`
-    const owner = {
-      token,
-      pid: process.pid,
-      cwd: process.cwd(),
-      startedAt: new Date().toISOString(),
-    }
-
-    for (;;) {
-      if (signal.aborted) throw abortError()
-      try {
-        mkdirSync(KIRO_STREAM_GATE_DIR)
-        const heartbeat = () => {
-          writeFileSync(KIRO_STREAM_GATE_OWNER, JSON.stringify({ ...owner, heartbeatAt: new Date().toISOString() }), { mode: 0o600 })
-        }
-        heartbeat()
-        const heartbeatTimer = setInterval(heartbeat, KIRO_STREAM_GATE_HEARTBEAT_MS)
-        return () => {
-          clearInterval(heartbeatTimer)
-          try {
-            const currentOwner = JSON.parse(readFileSync(KIRO_STREAM_GATE_OWNER, "utf-8")) as { token?: string }
-            if (currentOwner.token === token) {
-              rmSync(KIRO_STREAM_GATE_DIR, { recursive: true, force: true })
-            }
-          } catch { /* already released or replaced */ }
-        }
-      } catch (error: unknown) {
-        const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
-        if (code !== "EEXIST") throw error
-
-        let stale = false
-        try {
-          const stat = statSync(KIRO_STREAM_GATE_OWNER)
-          stale = Date.now() - stat.mtimeMs > KIRO_STREAM_GATE_STALE_MS
-            || !isProcessAlive((JSON.parse(readFileSync(KIRO_STREAM_GATE_OWNER, "utf-8")) as { pid?: unknown }).pid)
-        } catch {
-          stale = true
-        }
-        if (stale) {
-          rmSync(KIRO_STREAM_GATE_DIR, { recursive: true, force: true })
-          continue
-        }
-
-        await sleep(KIRO_STREAM_GATE_POLL_MS + Math.floor(Math.random() * 250), signal)
-      }
-    }
-  }
-
   return function streamKiro(
     model: ModelLike,
     context: ContextLike,
     options?: StreamOptions,
   ): AssistantMessageEventStreamLike {
+    const startedAt = monotonicNow()
+    let firstOutputAt: number | undefined
+    const recordTiming = (message: AssistantMessageLike) => {
+      message.duration = Math.max(0, monotonicNow() - startedAt)
+      if (firstOutputAt !== undefined) message.ttft = Math.max(0, firstOutputAt - startedAt)
+    }
     const stream = deps.createStream()
 
     async function run() {
@@ -320,6 +258,7 @@ export function createStreamKiro(deps: CoreDependencies) {
             "No Kiro access token. Run /login and select Kiro, or set KIRO_API_KEY.",
           timestamp: now(),
         }
+        recordTiming(msg)
         stream.push({ type: "error", reason: "error", error: msg })
         stream.end()
         return
@@ -338,7 +277,6 @@ export function createStreamKiro(deps: CoreDependencies) {
 
       const controller = new AbortController()
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
-      let releaseKiroStreamGate: (() => void) | undefined
 
       const abortUpstream = () => {
         if (!controller.signal.aborted) controller.abort()
@@ -372,6 +310,16 @@ export function createStreamKiro(deps: CoreDependencies) {
       // Token counts Kiro reported for this attempt; they replace the estimates.
       let reportedUsage: Partial<Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "reasoning">> = {}
       let contextUsagePercentage = 0
+
+      const recordUsage = () => {
+        // Provider counts override estimates, including on a stream that ends in an error.
+        output.usage.input = contextUsagePercentage > 0
+          ? Math.round((contextUsagePercentage / 100) * model.contextWindow) : 0
+        output.usage.output = totalContentLength > 0 ? Math.max(1, Math.floor(totalContentLength / 4)) : 0
+        Object.assign(output.usage, reportedUsage)
+        output.usage.totalTokens = output.usage.input + output.usage.output
+          + output.usage.cacheRead + output.usage.cacheWrite + (output.usage.reasoning ?? 0)
+      }
 
       // Hidden-reasoning state, hoisted so the error path can clean it up.
       let hiddenThinkingIndex: number | null = null
@@ -431,6 +379,11 @@ export function createStreamKiro(deps: CoreDependencies) {
       }
 
       const handleEvent = (event: ReturnType<AwsEventStreamParser["feed"]>[number]) => {
+        // Metadata and the synthetic hidden-reasoning marker are not model output.
+        if (event.type === "content" || event.type === "reasoning" || event.type === "reasoning_redacted"
+          || event.type === "tool_start" || event.type === "tool_input") {
+          firstOutputAt ??= monotonicNow()
+        }
         switch (event.type) {
           case "reasoning": {
             // Some models stream reasoning on a dedicated channel
@@ -486,6 +439,7 @@ export function createStreamKiro(deps: CoreDependencies) {
           }
 
           case "tool_start": {
+            totalContentLength += event.input.length
             sawAnyToolCalls = true
             closeHiddenBreadcrumb()
             endTextBlock()
@@ -503,6 +457,7 @@ export function createStreamKiro(deps: CoreDependencies) {
           case "tool_input": {
             if (currentToolCall) {
               currentToolCall.inputChunks.push(event.input)
+              totalContentLength += event.input.length
             }
             break
           }
@@ -553,6 +508,7 @@ export function createStreamKiro(deps: CoreDependencies) {
         totalContentLength = 0
         reportedUsage = {}
         contextUsagePercentage = 0
+        firstOutputAt = undefined
       }
 
       const cancelHiddenMarkerTimer = () => {
@@ -679,8 +635,6 @@ export function createStreamKiro(deps: CoreDependencies) {
           ...userHeaders,
         }
 
-        releaseKiroStreamGate = await acquireKiroStreamGate(controller.signal)
-
         // Outer loop: retries for model capacity, empty responses, and stream timeouts.
         const maxAttempts = 1 + MAX_CAPACITY_RETRIES + MAX_EMPTY_RETRIES
         for (let outerAttempt = 0; outerAttempt < maxAttempts; outerAttempt++) {
@@ -771,7 +725,7 @@ export function createStreamKiro(deps: CoreDependencies) {
 
             // Retry only transient server errors. 429 means Kiro is applying
             // account-level backpressure, so local immediate retries amplify it.
-            if (response.status >= 500) continue
+            if (response.status >= 500 && retryAfterMs(response.headers, now()) === undefined) continue
             break
           }
           if (!response) throw new Error("No response from Kiro API after retries")
@@ -787,14 +741,17 @@ export function createStreamKiro(deps: CoreDependencies) {
           )
 
           if (!response.ok) {
+            output.errorStatus = response.status
             const errBody = await raceAbort(
               response.text().catch(() => ""),
               controller.signal,
             )
-            if (errBody.includes("TEMPORARILY_SUSPENDED") || errBody.includes("ThrottlingException")) {
-              throw new Error(`Kiro account suspended or throttled. Response: ${errBody.slice(0, 300)}`)
+            if (errBody.includes("TEMPORARILY_SUSPENDED")) {
+              throw new Error(`Kiro account suspended. Response: ${errBody.slice(0, 300)}`)
             }
-            throw new Error(`Kiro API error ${response.status}: ${errBody.slice(0, 500)}`)
+            // OMP's retry policy reads this hint from the terminal error message.
+            const delay = retryAfterMs(response.headers, now())
+            throw new Error(`Kiro API error ${response.status}: ${errBody.slice(0, 500)}${delay === undefined ? "" : ` (retry-after-ms=${delay})`}`)
           }
 
           try {
@@ -975,20 +932,9 @@ export function createStreamKiro(deps: CoreDependencies) {
           }
         }
 
-        // Input is estimated from contextUsagePercentage and output from the character count;
-        // token counts Kiro reported replace either estimate.
-        if (contextUsagePercentage > 0) {
-          output.usage.input = Math.round((contextUsagePercentage / 100) * model.contextWindow)
-        }
-        output.usage.output = totalContentLength > 0 ? Math.max(1, Math.floor(totalContentLength / 4)) : 0
-        Object.assign(output.usage, reportedUsage)
-        output.usage.totalTokens =
-          output.usage.input +
-          output.usage.output +
-          output.usage.cacheRead +
-          output.usage.cacheWrite +
-          (output.usage.reasoning ?? 0)
+        recordUsage()
         output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop"
+        recordTiming(output)
         stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output })
         stream.end()
       } catch (error: unknown) {
@@ -1005,13 +951,14 @@ export function createStreamKiro(deps: CoreDependencies) {
             : error instanceof Error
               ? error.message
               : String(error)
+        recordUsage()
+        recordTiming(output)
         stream.push({ type: "error", reason, error: output })
         stream.end()
       } finally {
         cancelHiddenMarkerTimer()
         options?.signal?.removeEventListener("abort", abortUpstream)
         await releaseReader()
-        releaseKiroStreamGate?.()
       }
     }
 
@@ -1027,6 +974,7 @@ export function createStreamKiro(deps: CoreDependencies) {
         errorMessage: error instanceof Error ? error.message : String(error),
         timestamp: now(),
       }
+      recordTiming(msg)
       stream.push({ type: "error", reason: "error", error: msg })
       stream.end()
     })
