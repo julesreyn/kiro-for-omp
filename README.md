@@ -24,11 +24,13 @@ omp models kiro
 
 Nothing listed? You are not signed in yet: see [Sign in](#sign-in).
 
-To update to the latest version, run the same command with `--force`, then restart OMP:
+To update, quit OMP and reinstall from GitHub with `--force`, then start a new session:
 
 ```sh
 omp install --force github:julesreyn/kiro-for-omp
 ```
+
+`--force` updates the commit pinned by OMP. `omp plugin upgrade` only updates marketplace plugins.
 
 ## Sign in
 
@@ -69,6 +71,33 @@ omp -p --model kiro/claude-opus-5-5 --thinking max "Review this diff"
 The model may introduce itself as "Kiro". Kiro's servers add their own system prompt, and recent
 models follow it over OMP's. You are still talking to the model you selected.
 
+### Parallel sessions and subagents
+
+OMP manages concurrent requests. With OMP 18.12.6 or newer, start with a limit of three Kiro
+requests across local sessions. Merge this into `~/.omp/agent/config.yml`:
+
+```yaml
+providers:
+  maxInFlightRequests:
+    kiro: 3
+```
+
+Restart OMP after changing the setting. Use `1` for serial requests. If omitted, OMP does not
+limit Kiro concurrency. The extension no longer has its own streaming lock;
+`OMP_KIRO_STREAM_GATE` and `KIRO_STREAM_GATE` are no longer used.
+
+### Performance statistics
+
+New responses record duration and time to first token (TTFT) for OMP's status line and `omp stats`.
+TTFT measures the first model output, including reasoning or a tool call; it excludes the synthetic
+"Reasoning hidden" marker. Timing starts when OMP hands the request to the provider, so it excludes
+OMP's concurrency queue and includes retries within the provider.
+
+OMP calculates tokens/s from output tokens divided by the full request duration, including TTFT.
+Kiro's reported token counts take precedence. When unavailable, output tokens are estimated from
+text and tool arguments, so tokens/s is approximate. Older responses without timing fields cannot
+gain an exact TTFT retrospectively.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -76,7 +105,7 @@ models follow it over OMP's. You are still talking to the model you selected.
 | `omp models kiro` lists nothing | Sign in with `/login`, then run `omp models refresh kiro`. |
 | `No API key found for kiro` | Your session expired. Run `kiro-cli whoami` (or `kiro-cli login`), then `/login` → **1**. |
 | An update has no effect | Quit every `omp` session and run `rm ~/.omp/cache/legacy-pi-extension-cache.db*`. |
-| Sessions wait on each other | Only one Kiro response streams at a time, to avoid throttling. Set `OMP_KIRO_STREAM_GATE=0` to allow parallel streams. |
+| Sessions wait on each other | Check `providers.maxInFlightRequests.kiro` in OMP's settings. The extension leaves concurrency to OMP. |
 | Wrong region or profile | Set `KIRO_REGION` (default `us-east-1`) or `KIRO_PROFILE_ARN`. |
 
 ## How it works
@@ -127,7 +156,8 @@ update to the extension. OMP caches the catalog and refreshes it daily, after `/
 - Responses are AWS Event Stream frames, checked against their checksums.
 - Capacity errors, empty responses and server errors are retried, but only before any output has
   been shown.
-- When a session exits mid-response, the next one can stream immediately.
+- HTTP errors pass their status and `Retry-After` delay to OMP's retry policy. Server-requested
+  delays are not shortened by the extension.
 
 </details>
 

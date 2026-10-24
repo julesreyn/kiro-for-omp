@@ -15,7 +15,7 @@ const previousTmpdir = process.env.TMPDIR
 const previousPath = process.env.PATH
 process.env.HOME = home
 process.env.USERPROFILE = home
-// The stream gate lives under the temp directory; keep it apart from running omp sessions.
+// Keep temporary runtime files apart from running OMP sessions.
 process.env.TMPDIR = home
 // A refresh may ask kiro-cli to renew its login; never reach the developer's real kiro-cli.
 const noKiroCli = join(home, "no-kiro-cli")
@@ -134,7 +134,7 @@ describe("organization login", () => {
         async *[Symbol.asyncIterator]() { yield* events },
       }),
       now: () => Date.now(),
-      env: { OMP_KIRO_STREAM_GATE: "0" },
+      env: {},
     })
     const output = await streamKiro({
       id: "claude-opus-5-5", name: "Claude Opus 5.5", api: "kiro-custom", provider: "kiro",
@@ -359,7 +359,7 @@ describe("cancelling while the profile is resolved", () => {
         async *[Symbol.asyncIterator]() { yield* events },
       }),
       now: () => Date.now(),
-      env: { OMP_KIRO_STREAM_GATE: "0" },
+      env: {},
     })
     const output = await streamKiro({
       id: "claude-opus-5-5", name: "Claude Opus 5.5", api: "kiro-custom", provider: "kiro",
@@ -402,7 +402,7 @@ function kiroTurns(
       }
     },
     now: () => Date.now(),
-    env: { OMP_KIRO_STREAM_GATE: "0" },
+    env: {},
     ...deps,
   })
   return (apiKey, options = {}, context = { messages: [{ role: "user", content: "Reply OK" }] }) => streamKiro({
@@ -570,19 +570,22 @@ describe("reasoning stream", () => {
 
   it("drops the hidden-reasoning placeholder once readable reasoning arrives", async () => {
     // The placeholder appears after two seconds of silence.
+    let clock = 0
     const late = new ReadableStream<Uint8Array>({
       async start(controller) {
         await new Promise((resolve) => setTimeout(resolve, 2_200))
+        clock = 3000
         controller.enqueue(frames(reasoning("visible"), content("OK")))
         controller.close()
       },
     })
     const { fetchImpl } = kiro([late])
-    const output = await kiroTurns(fetchImpl, HIDDEN_REASONING_MODEL, HIDDEN_REASONING)(
+    const output = await kiroTurns(fetchImpl, HIDDEN_REASONING_MODEL, { ...HIDDEN_REASONING, monotonicNow: () => clock })(
       "late-reasoning-token", { reasoning: "high" })
     assert.equal(output.stopReason, "stop", output.errorMessage)
     assert.deepEqual(output.content.map((block) => block.type), ["thinking", "text"])
     assert.deepEqual(output.content[0], { type: "thinking", thinking: "visible" })
+    assert.equal(output.ttft, 3000, "the synthetic placeholder must not start TTFT")
   })
 
   // OMP drops custom model fields such as `reasoningHidden`, so the provider passes the ids itself.
@@ -1095,18 +1098,169 @@ describe("kiro-cli on macOS with a GitHub or Google login", () => {
   })
 })
 
-describe("stream gate", () => {
-  it("takes over at once from an owner that exited without releasing it", { timeout: 10_000 }, async (t) => {
-    const gateDir = join(tmpdir(), "kiro-for-omp", "stream.lock")
-    mkdirSync(gateDir, { recursive: true })
-    t.after(() => rmSync(gateDir, { recursive: true, force: true }))
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid
-    writeFileSync(join(gateDir, "owner.json"), JSON.stringify({ token: "crashed", pid: deadPid, heartbeatAt: new Date().toISOString() }))
-
-    const output = await kiroTurns((async (input: RequestInfo | URL) =>
-      new URL(String(input)).pathname === "/List-Available-Profiles"
-        ? response({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/default" }] })
-        : eventStream(content("OK"))) as typeof fetch, {}, { env: {} })("token")
-    assert.equal(output.stopReason, "stop", output.errorMessage)
+describe("provider concurrency", () => {
+  it("lets OMP schedule simultaneous streams without another global queue", { timeout: 3000 }, async (t) => {
+    const controller = new AbortController()
+    const bodies: ReadableStreamDefaultController<Uint8Array>[] = []
+    let allStarted!: () => void
+    const started = new Promise<void>((resolve) => { allStarted = resolve })
+    t.after(() => controller.abort())
+    const turn = kiroTurns((async (input: RequestInfo | URL) => {
+      if (String(input).includes("List-Available-Profiles")) return response({ profiles: [
+        { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/default" },
+      ] })
+      return new Response(new ReadableStream<Uint8Array>({ start(body) {
+        bodies.push(body)
+        if (bodies.length === 3) allStarted()
+      } }))
+    }) as typeof fetch, {}, { env: {} })
+    const results = [1, 2, 3].map(() => turn("parallel-token", { signal: controller.signal }))
+    await Promise.race([started, new Promise((resolve) => setTimeout(resolve, 250))])
+    assert.equal(bodies.length, 3, "all three requests must start before any response finishes")
+    for (const body of bodies) { body.enqueue(content("OK")); body.close() }
+    for (const result of await Promise.all(results)) assert.equal(result.stopReason, "stop", result.errorMessage)
   })
+})
+
+describe("request metrics", () => {
+  function timedTurn(steps: Array<{ at: number; bytes?: Uint8Array }>, options: Partial<CoreDependencies> = {}) {
+    let clock = 0
+    return kiroTurns((async (input: RequestInfo | URL) => {
+      if (String(input).includes("List-Available-Profiles")) return response({ profiles: [
+        { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/default" },
+      ] })
+      return new Response(new ReadableStream<Uint8Array>({ pull(body) {
+        const step = steps.shift()!
+        clock = step.at
+        if (step.bytes) body.enqueue(step.bytes)
+        else body.close()
+      } }, { highWaterMark: 0 }))
+    }) as typeof fetch, {}, { monotonicNow: () => clock, ...options })
+  }
+
+  it("reports OMP duration and TTFT, ignoring usage metadata before the first token", async () => {
+    const result = await timedTurn([
+      { at: 100, bytes: frame("metadataEvent", { tokenUsage: { inputTokens: 200, outputTokens: 100 } }) },
+      { at: 500, bytes: content("Hello") },
+      { at: 2000 },
+    ])("metrics-token")
+    assert.equal(result.stopReason, "stop", result.errorMessage)
+    assert.equal(result.ttft, 500)
+    assert.equal(result.duration, 2000)
+    assert.equal(result.usage.output, 100)
+    assert.equal(result.usage.output * 1000 / result.duration!, 50)
+  })
+
+  it("times the start of an actual tool call and estimates its streamed arguments", async () => {
+    const result = await timedTurn([
+      { at: 100, bytes: frame("toolUseEvent", { toolUseId: "t", name: "read", input: '{"path":' }) },
+      { at: 400, bytes: frame("toolUseEvent", { toolUseId: "t", input: '"file.txt"}', stop: true }) },
+      { at: 500 },
+    ])("tool-metrics-token")
+    assert.equal(result.stopReason, "toolUse", result.errorMessage)
+    assert.equal(result.ttft, 100)
+    assert.equal(result.duration, 500)
+    assert.equal(result.usage.output, Math.floor('{"path":"file.txt"}'.length / 4))
+  })
+
+  it("records streamed reasoning as model output", async () => {
+    const result = await timedTurn([
+      { at: 200, bytes: reasoning("Let me think") },
+      { at: 700, bytes: content("OK") },
+      { at: 1000 },
+    ])("reasoning-metrics-token", { reasoning: "low" })
+    assert.equal(result.ttft, 200)
+    assert.equal(result.duration, 1000)
+  })
+
+  it("records duration without inventing TTFT when the stream fails before output", async () => {
+    const result = await timedTurn([
+      { at: 350, bytes: frame("validationError", { message: "Invalid input" }) },
+    ])("failed-metrics-token")
+    assert.equal(result.stopReason, "error")
+    assert.equal(result.duration, 350)
+    assert.equal(result.ttft, undefined)
+  })
+
+  it("keeps timing on a stream that fails after partial output", async () => {
+    const result = await timedTurn([
+      { at: 200, bytes: content("Partial") },
+      { at: 600, bytes: frame("validationError", { message: "Invalid input" }) },
+    ])("partial-metrics-token")
+    assert.equal(result.stopReason, "error")
+    assert.equal(result.ttft, 200)
+    assert.equal(result.duration, 600)
+    assert.equal(result.usage.output, 1)
+    assert.equal(result.usage.totalTokens, 1)
+  })
+
+  it("preserves reported token counts when a stream later fails", async () => {
+    const result = await timedTurn([
+      { at: 200, bytes: content("Partial") },
+      { at: 400, bytes: frame("metadataEvent", { tokenUsage: { inputTokens: 200, outputTokens: 100 } }) },
+      { at: 600, bytes: frame("validationError", { message: "Invalid input" }) },
+    ])("failed-usage-token")
+    assert.equal(result.stopReason, "error")
+    assert.equal(result.duration, 600)
+    assert.equal(result.usage.input, 200)
+    assert.equal(result.usage.output, 100)
+    assert.equal(result.usage.totalTokens, 300)
+  })
+
+  it("discards the first token of a retried attempt", async () => {
+    let clock = 0
+    let calls = 0
+    const result = await kiroTurns((async (input: RequestInfo | URL) => {
+      if (String(input).includes("List-Available-Profiles")) return response({ profiles: [
+        { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/default" },
+      ] })
+      clock = ++calls === 1 ? 200 : 2500
+      return calls === 1
+        ? eventStream(content("Discarded"), frame("throttlingError", { reason: "INSUFFICIENT_MODEL_CAPACITY" }))
+        : eventStream(content("OK"))
+    }) as typeof fetch, {}, { monotonicNow: () => clock })("retry-metrics-token")
+    assert.equal(calls, 2)
+    assert.equal(result.stopReason, "stop", result.errorMessage)
+    assert.equal(result.ttft, 2500)
+    assert.equal(result.duration, 2500)
+  })
+})
+
+describe("HTTP retry hints", () => {
+  it("leaves a server-requested 503 delay to OMP instead of retrying early", async () => {
+    let inference = 0
+    const result = await kiroTurns((async (input: RequestInfo | URL) => {
+      if (String(input).includes("List-Available-Profiles")) return response({ profiles: [
+        { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/default" },
+      ] })
+      inference++
+      return new Response("Unavailable", { status: 503, headers: { "Retry-After": "60", "retry-after-ms": "1250" } })
+    }) as typeof fetch)("unavailable-hint-token")
+    assert.equal(inference, 1)
+    assert.equal(result.errorStatus, 503)
+    assert.match(result.errorMessage!, /retry-after-ms=60000\b/)
+  })
+
+  for (const [header, value, expected] of [
+    ["Retry-After", "45", 45000],
+    ["Retry-After", "Thu, 01 Jan 2026 00:00:45 GMT", 45000],
+    ["retry-after-ms", "1250", 1250],
+    ["Retry-After", "invalid", undefined],
+  ] as const) {
+    it(`passes ${header}: ${value} to OMP without retrying HTTP 429 internally`, async () => {
+      let inference = 0
+      const result = await kiroTurns((async (input: RequestInfo | URL) => {
+        if (String(input).includes("List-Available-Profiles")) return response({ profiles: [
+          { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/default" },
+        ] })
+        inference++
+        return new Response("Rate exceeded", { status: 429, headers: { [header]: value } })
+      }) as typeof fetch, {}, { now: () => Date.parse("2026-01-01T00:00:00Z") })("throttled-token")
+      assert.equal(inference, 1)
+      assert.equal(result.stopReason, "error")
+      assert.equal(result.errorStatus, 429)
+      if (expected === undefined) assert.doesNotMatch(result.errorMessage!, /retry-after-ms/)
+      else assert.match(result.errorMessage!, new RegExp(`retry-after-ms=${expected}\\b`))
+    })
+  }
 })
